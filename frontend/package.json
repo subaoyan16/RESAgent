@@ -1,0 +1,29 @@
+{
+  "name": "resagent-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev --port 3000",
+    "build": "nuxt build",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "nuxt": "^3.15.0",
+    "vue": "^3.5.0",
+    "pinia": "^2.2.0",
+    "@pinia/nuxt": "^0.9.0",
+    "element-plus": "^2.9.0",
+    "@element-plus/nuxt": "^1.0.0",
+    "@element-plus/icons-vue": "^2.3.0",
+    "marked": "^14.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@nuxtjs/eslint-config-typescript": "^12.0.0",
+    "prettier": "^3.4.0"
+  }
+}

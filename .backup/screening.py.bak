@@ -1,0 +1,774 @@
+"""
+模块: 筛选任务管理 API 端点
+提供筛选任务的创建、监控和人工反馈功能，是系统的主工作流触发入口。
+多智能体筛选任务在后台异步执行，通过 SSE（Server-Sent Events）实时推送进度。
+"""
+import asyncio
+import json
+import os
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
+
+from models.base import get_db, SessionLocal
+from models.job import Job
+from models.candidate import Candidate
+from models.screening_task import ScreeningTask
+from models.match_result import MatchResult
+from models.bias_report import BiasReport
+from api.schemas.screening import (
+    ScreeningTaskCreate,
+    ScreeningTaskRead,
+    MatchResultRead,
+    MatchDetailSchema,
+    GapSchema,
+    TransferableSkillSchema,
+)
+from api.schemas.common import (
+    MessageResponse,
+    PaginatedResponse,
+)
+
+router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# SSE 事件流使用的内存存储
+# ---------------------------------------------------------------------------
+
+# 每个任务对应一个 asyncio.Queue，用于在后台工作流和 SSE 端点之间传递事件
+_event_queues: dict[str, asyncio.Queue] = {}
+# 跟踪后台运行的 asyncio.Task 以便于管理和清理
+_running_tasks: dict[str, asyncio.Task] = {}
+
+# ---------------------------------------------------------------------------
+# 内部辅助函数
+# ---------------------------------------------------------------------------
+
+
+def _task_to_read(task: ScreeningTask, db: Session) -> ScreeningTaskRead:
+    """将 ScreeningTask ORM 实例转换为 ScreeningTaskRead 响应模型。
+
+    Args:
+        task: ScreeningTask ORM 实例
+
+    Returns:
+        ScreeningTaskRead 响应模型
+    """
+    # 查询关联的岗位名称（job 表）
+    from models.job import Job
+    job = db.query(Job).filter(Job.id == task.job_id).first()
+    return ScreeningTaskRead(
+        id=uuid.UUID(task.id),
+        job_id=uuid.UUID(task.job_id),
+        job_title=job.title if job else "未知岗位",
+        status=task.status,
+        total_candidates=task.total_candidates or 0,
+        processed_candidates=task.processed_candidates,
+        created_at=(
+            datetime.fromisoformat(task.created_at)
+            if task.created_at else datetime.now(timezone.utc)
+        ),
+        completed_at=(
+            datetime.fromisoformat(task.completed_at)
+            if task.completed_at else None
+        ),
+    )
+
+
+def _match_to_read(match: MatchResult) -> MatchResultRead:
+    """将 MatchResult ORM 实例转换为 MatchResultRead 响应模型。
+
+    解析 JSON 字段（dimension_scores、matched_skills 等）为结构化的 Pydantic 子模型。
+
+    Args:
+        match: MatchResult ORM 实例
+
+    Returns:
+        MatchResultRead 响应模型
+    """
+    return MatchResultRead(
+        id=uuid.UUID(match.id),
+        candidate_id=uuid.UUID(match.candidate_id),
+        job_id=uuid.UUID(match.job_id),
+        overall_score=match.overall_score or 0.0,
+        dimension_scores=(
+            json.loads(match.dimension_scores) if match.dimension_scores else {}
+        ),
+        matched_skills=[
+            MatchDetailSchema(**s)
+            for s in (json.loads(match.matched_skills) if match.matched_skills else [])
+        ],
+        gaps=[
+            GapSchema(**g)
+            for g in (json.loads(match.gaps) if match.gaps else [])
+        ],
+        transferable_skills=[
+            TransferableSkillSchema(**t)
+            for t in (json.loads(match.transferable_skills) if match.transferable_skills else [])
+        ],
+        highlights=json.loads(match.highlights) if match.highlights else [],
+        risks=json.loads(match.risks) if match.risks else [],
+        recommendation=match.recommendation or "考虑",
+        match_rationale=match.match_rationale,
+    )
+
+
+def _write_candidate_temp_file(candidate: Candidate, db: Session) -> str | None:
+    """将候选人的原始简历文本写入临时文件，供解析器智能体读取。
+
+    利用 tempfile 创建临时文件，避免将大文本直接传递给外部进程。
+
+    Args:
+        candidate: Candidate ORM 实例
+
+    Returns:
+        临时文件路径，若无可用文本则返回 None
+    """
+    # 合并 detached 对像到当前 session，避免 DetachedInstanceError
+    merged = db.merge(candidate)
+    sd = json.loads(merged.structured_data) if merged.structured_data else {}
+    raw_text = sd.get("raw_text", "")
+    if not raw_text:
+        return None
+
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix=f"candidate_{merged.id}_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(raw_text)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 后台工作流执行器
+# ---------------------------------------------------------------------------
+
+
+def _make_event(event_type: str, **kwargs) -> dict:
+    """构建 SSE 事件字典，自动添加标准时间戳。
+
+    Args:
+        event_type: 事件类型名称
+        **kwargs: 其他事件字段
+
+    Returns:
+        格式化的事件字典
+    """
+    return {
+        "event": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **kwargs,
+    }
+
+
+async def _execute_screening_graph(
+    task_id: str,
+    job: Job,
+    candidates: list[Candidate],
+) -> None:
+    """在后台运行 LangGraph 多智能体筛选工作流。
+
+    逐个处理候选人，通过 asyncio.Queue 向 SSE 端点推送进度事件。
+    处理完所有候选人后，更新任务状态为 completed。
+
+    Args:
+        task_id: 筛选任务 ID
+        job: 职位信息
+        candidates: 待筛选的候选人列表
+    """
+    queue = _event_queues.get(task_id)
+    db = SessionLocal()
+    try:
+        # 发布工作流启动事件
+        _publish(queue, _make_event(
+            "workflow_start",
+            task_id=task_id,
+            status="running",
+            total=len(candidates),
+        ))
+
+        # 将任务标记为运行中
+        _update_task_status(db, task_id, status="running")
+
+        # 延迟导入避免循环依赖
+        from agent_orchestration.graph import screening_graph
+        from agent_orchestration.state import ScreeningState
+
+        # 在当前 session 中重新查询候选人，避免 DetachedInstanceError
+        candidate_ids = [c.id for c in candidates]
+        fresh_candidates = db.query(Candidate).filter(Candidate.id.in_(candidate_ids)).all()
+
+        for idx, candidate in enumerate(fresh_candidates, start=1):
+            file_path = _write_candidate_temp_file(candidate, db)
+            if not file_path:
+                _publish(queue, _make_event(
+                    "node_update",
+                    node="parser",
+                    candidate_id=candidate.id,
+                    status="skipped",
+                    reason="无可用文本",
+                ))
+                continue
+
+            _publish(queue, _make_event(
+                "candidate_start",
+                candidate_id=candidate.id,
+                name=candidate.name,
+                index=idx,
+                total=len(candidates),
+            ))
+
+            # 构建该候选人的初始工作流状态
+            initial_state = ScreeningState(
+                task_id=task_id,
+                job_id=job.id,
+                status="running",
+                resume_files=[file_path],
+                job_description=job.description or "",
+            )
+
+            config = {"configurable": {"thread_id": f"{task_id}_{candidate.id}"}}
+
+            try:
+                # 逐节点执行 LangGraph 图，流式获取每个节点的输出
+                # 同时累积状态更新到 final_state，用于后续持久化
+                final_state = dict(initial_state)
+                async for update in screening_graph.astream(
+                    initial_state,
+                    config,
+                    stream_mode="updates",
+                ):
+                    for node_name, output in update.items():
+                        if isinstance(output, dict):
+                            final_state.update(output)
+                        node_status = (
+                            output.get("status", "running")
+                            if isinstance(output, dict) else "running"
+                        )
+                        _publish(queue, _make_event(
+                            "node_update",
+                            node=node_name,
+                            candidate_id=candidate.id,
+                            status=node_status,
+                        ))
+
+                # 图执行完成后，持久化匹配结果到数据库
+                await _save_graph_results(db, task_id, candidate.id, job.id, final_state)
+
+            except Exception as exc:
+                import traceback; traceback.print_exc()
+                _publish(queue, _make_event(
+                    "node_update",
+                    node="workflow",
+                    candidate_id=candidate.id,
+                    status="failed",
+                    error=str(exc),
+                ))
+
+            # 更新已处理的候选人计数
+            if db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first() is not None:
+                db.query(ScreeningTask).filter(ScreeningTask.id == task_id).update(
+                    {"processed_candidates": idx}
+                )
+                db.commit()
+
+        # 标记任务为已完成
+        _update_task_status(db, task_id, status="completed")
+
+        # 查询匹配结果，推送给前端展示
+        matches = db.query(MatchResult).filter(MatchResult.task_id == task_id).all()
+        candidates_data = []
+        for m in matches:
+            candidate = db.query(Candidate).filter(Candidate.id == m.candidate_id).first()
+            candidates_data.append({
+                "id": m.candidate_id,
+                "name": candidate.name if candidate else "未知",
+                "overall_score": m.overall_score,
+                "recommendation": m.recommendation,
+            })
+
+        _publish(queue, _make_event(
+            "workflow_complete",
+            task_id=task_id,
+            status="completed",
+            candidates=candidates_data,
+        ))
+        _publish(queue, {"event": "__done__"})
+
+    except Exception as exc:
+        # 异常时将任务标记为失败，打印完整 traceback
+        import traceback
+        _update_task_status(db, task_id, status="failed")
+        _publish(queue, _make_event(
+            "workflow_error",
+            task_id=task_id,
+            status="failed",
+            error=str(exc),
+        ))
+        _publish(queue, {"event": "__done__"})
+    finally:
+        db.close()
+        # 清理内存中的事件队列和任务引用
+        _event_queues.pop(task_id, None)
+        _running_tasks.pop(task_id, None)
+
+
+def _update_task_status(db: Session, task_id: str, status: str) -> None:
+    """更新筛选任务的状态和完成时间。
+
+    Args:
+        db: 数据库会话
+        task_id: 筛选任务 ID
+        status: 新状态（running/completed/failed）
+    """
+    task = db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first()
+    if task:
+        task.status = status
+        if status in ("completed", "failed"):
+            task.completed_at = datetime.now(timezone.utc).isoformat()
+        db.commit()
+
+
+def _publish(queue: asyncio.Queue | None, event: dict) -> None:
+    """将事件推送到队列（如果队列存在）。
+
+    Args:
+        queue: asyncio 事件队列
+        event: 事件字典
+    """
+    if queue is not None:
+        queue.put_nowait(event)
+
+
+async def _save_graph_results(
+    db: Session,
+    task_id: str,
+    candidate_id: str,
+    job_id: str,
+    state: dict[str, Any],
+) -> None:
+    """将图工作流的匹配结果和偏差报告持久化到数据库。
+
+    避免重复保存相同 (task, candidate) 的匹配结果。
+
+    Args:
+        db: 数据库会话
+        task_id: 筛选任务 ID
+        candidate_id: 候选人 ID
+        job_id: 职位 ID
+        state: 工作流结束时的最终状态字典
+    """
+    match_result = state.get("match_result")
+    if not match_result:
+        return
+
+    # 检查是否已存在相同 (task, candidate) 的匹配结果，避免重复
+    existing = (
+        db.query(MatchResult)
+        .filter(
+            MatchResult.task_id == task_id,
+            MatchResult.candidate_id == candidate_id,
+        )
+        .first()
+    )
+    if existing:
+        return
+
+    match_record = MatchResult(
+        id=str(uuid.uuid4()),
+        task_id=task_id,
+        candidate_id=candidate_id,
+        job_id=job_id,
+        overall_score=match_result.get("overall_match_score"),
+        dimension_scores=json.dumps(
+            match_result.get("dimension_scores", {}), ensure_ascii=False
+        ),
+        matched_skills=json.dumps(
+            match_result.get("matched_skills", []), ensure_ascii=False
+        ),
+        gaps=json.dumps(match_result.get("gaps", []), ensure_ascii=False),
+        transferable_skills=json.dumps(
+            match_result.get("transferable_skills", []), ensure_ascii=False
+        ),
+        highlights=json.dumps(
+            match_result.get("highlights", []), ensure_ascii=False
+        ),
+        risks=json.dumps(match_result.get("risks", []), ensure_ascii=False),
+        recommendation=match_result.get("recommendation"),
+        match_rationale=match_result.get("match_rationale"),
+    )
+    db.add(match_record)
+
+    # 如果工作流返回了偏差报告，也一并持久化
+    bias_report = state.get("bias_report")
+    if bias_report:
+        existing_bias = (
+            db.query(BiasReport)
+            .filter(BiasReport.task_id == task_id)
+            .first()
+        )
+        if not existing_bias:
+            bias_record = BiasReport(
+                id=str(uuid.uuid4()),
+                task_id=task_id,
+                fairness_score=bias_report.get("overall_fairness_score"),
+                flags=json.dumps(
+                    bias_report.get("flags", []), ensure_ascii=False
+                ),
+                distribution_analysis=json.dumps(
+                    bias_report.get("distribution_analysis", {}), ensure_ascii=False
+                ),
+            )
+            db.add(bias_record)
+
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# API 端点
+# ---------------------------------------------------------------------------
+
+
+@router.post("/run", response_model=ScreeningTaskRead, status_code=201)
+async def run_screening(
+    body: ScreeningTaskCreate,
+    db: Session = Depends(get_db),
+):
+    """创建筛选任务并启动多智能体工作流。
+
+    LangGraph 工作流在后台异步执行，可通过 ``GET /{task_id}/stream`` SSE 端点
+    实时监控进度，或通过 ``GET /{task_id}`` 轮询状态。
+
+    Args:
+        body: 筛选任务创建请求（包含职位 ID 和简历 ID 列表）
+        db: 数据库会话
+
+    Returns:
+        创建的筛选任务信息
+
+    Raises:
+        HTTPException 404: 职位不存在
+        HTTPException 400: 候选人均不存在或部分不存在
+    """
+    # --- 验证输入 -----------------------------------------------------------
+    job = db.query(Job).filter(Job.id == str(body.job_id)).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="职位不存在")
+
+    candidates = (
+        db.query(Candidate)
+        .filter(Candidate.id.in_(body.resume_ids))
+        .all()
+    )
+    if not candidates:
+        raise HTTPException(status_code=400, detail="未找到有效候选人")
+
+    found_ids = {c.id for c in candidates}
+    missing = [rid for rid in body.resume_ids if rid not in found_ids]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"以下候选人不存在: {', '.join(missing)}",
+        )
+
+    # --- 创建任务记录 -------------------------------------------------------
+    task = ScreeningTask(
+        id=str(uuid.uuid4()),
+        job_id=str(body.job_id),
+        status="pending",
+        total_candidates=len(candidates),
+        processed_candidates=0,
+        config=json.dumps(body.config or {}, ensure_ascii=False),
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    # --- 启动后台工作进程 ---------------------------------------------------
+    queue: asyncio.Queue = asyncio.Queue()
+    _event_queues[task.id] = queue
+
+    bg_task = asyncio.create_task(
+        _execute_screening_graph(task.id, job, candidates),
+    )
+    _running_tasks[task.id] = bg_task
+
+    return _task_to_read(task, db)
+
+
+@router.get("/", response_model=PaginatedResponse[ScreeningTaskRead])
+async def list_screening_tasks(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    db: Session = Depends(get_db),
+):
+    """获取所有筛选任务列表，支持分页。
+
+    Args:
+        page: 当前页码
+        page_size: 每页条数
+        db: 数据库会话
+
+    Returns:
+        分页的筛选任务列表
+    """
+    query = db.query(ScreeningTask).order_by(desc(ScreeningTask.created_at))
+    total = query.count()
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    return PaginatedResponse[ScreeningTaskRead](
+        items=[_task_to_read(t, db) for t in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=max(1, (total + page_size - 1) // page_size),
+    )
+
+
+@router.get("/{task_id}", response_model=ScreeningTaskRead)
+async def get_screening_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+):
+    """查询单个筛选任务的当前状态和进度。
+
+    Args:
+        task_id: 筛选任务 ID
+        db: 数据库会话
+
+    Returns:
+        筛选任务信息
+
+    Raises:
+        HTTPException 404: 任务不存在
+    """
+    task = db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="筛选任务不存在")
+    return _task_to_read(task, db)
+
+
+@router.get("/{task_id}/results")
+async def get_screening_results(
+    task_id: str,
+    db: Session = Depends(get_db),
+):
+    """获取筛选任务的完整结果：匹配详情 + 偏见报告 + 候选人信息"""
+    task = db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="筛选任务不存在")
+
+    # 查询所有匹配结果
+    matches = db.query(MatchResult).filter(MatchResult.task_id == task_id).all()
+    candidates_list = []
+    for m in matches:
+        candidate = db.query(Candidate).filter(Candidate.id == m.candidate_id).first()
+        # 解析 JSON 字段
+        dim_scores = json.loads(m.dimension_scores) if m.dimension_scores else {}
+        m_skills = json.loads(m.matched_skills) if m.matched_skills else []
+        m_gaps = json.loads(m.gaps) if m.gaps else []
+        m_transfer = json.loads(m.transferable_skills) if m.transferable_skills else []
+        highlights = json.loads(m.highlights) if m.highlights else []
+        risks = json.loads(m.risks) if m.risks else []
+
+        candidates_list.append({
+            "candidate_id": m.candidate_id,
+            "name": candidate.name if candidate else "未知",
+            "email": candidate.email if candidate else "",
+            "years_of_experience": candidate.years_of_experience if candidate else 0,
+            "overall_score": m.overall_score,
+            "recommendation": m.recommendation,
+            "dimension_scores": dim_scores,
+            "matched_skills": m_skills,
+            "gaps": m_gaps,
+            "transferable_skills": m_transfer,
+            "highlights": highlights,
+            "risks": risks,
+            "match_rationale": m.match_rationale,
+        })
+
+    # 查询偏见检测结果
+    bias = db.query(BiasReport).filter(BiasReport.task_id == task_id).first()
+    bias_data = None
+    if bias:
+        bias_data = {
+            "fairness_score": bias.fairness_score,
+            "flags": json.loads(bias.flags) if bias.flags else [],
+            "distribution_analysis": json.loads(bias.distribution_analysis) if bias.distribution_analysis else {},
+        }
+
+    # 查询岗位信息
+    job = db.query(Job).filter(Job.id == task.job_id).first()
+
+    return {
+        "task_id": task_id,
+        "status": task.status,
+        "job_title": job.title if job else "",
+        "total_candidates": task.total_candidates,
+        "candidates": candidates_list,
+        "bias_report": bias_data,
+    }
+
+
+@router.delete("/{task_id}", response_model=MessageResponse)
+async def delete_screening_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+):
+    """删除筛选任务及其关联数据"""
+    task = db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="筛选任务不存在")
+    db.query(MatchResult).filter(MatchResult.task_id == task_id).delete()
+    db.query(BiasReport).filter(BiasReport.task_id == task_id).delete()
+    db.delete(task)
+    db.commit()
+    return MessageResponse(message=f"任务 {task_id} 已删除")
+
+
+@router.get("/{task_id}/stream")
+async def stream_screening_events(task_id: str):
+    """SSE（Server-Sent Events）端点，实时推送智能体工作流的进度事件。
+
+    事件格式遵循 SSE 规范：``data: <json>\\n\\n``。
+    工作流完成或失败时流自动结束。
+
+    Args:
+        task_id: 筛选任务 ID
+
+    Returns:
+        StreamingResponse，持续输出 SSE 格式的事件流
+
+    Raises:
+        HTTPException 404: 任务不存在
+    """
+    queue = _event_queues.get(task_id)
+
+    if queue is None:
+        # 没有活跃队列 — 从数据库检查任务状态
+        db = SessionLocal()
+        try:
+            task = db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first()
+            if not task:
+                raise HTTPException(status_code=404, detail="筛选任务不存在")
+
+            if task.status == "completed":
+                return StreamingResponse(
+                    _done_stream("completed"),
+                    media_type="text/event-stream",
+                    headers=_sse_headers(),
+                )
+            if task.status == "failed":
+                return StreamingResponse(
+                    _done_stream("failed"),
+                    media_type="text/event-stream",
+                    headers=_sse_headers(),
+                )
+
+            # 任务存在但尚未开始 — 创建队列等待事件
+            queue = asyncio.Queue()
+            _event_queues[task_id] = queue
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        _event_generator(queue),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
+
+
+def _sse_headers() -> dict[str, str]:
+    """返回标准的 SSE HTTP 响应头，禁用缓存和缓冲。
+
+    Returns:
+        SSE 所需的 HTTP 头部字典
+    """
+    return {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+
+async def _done_stream(status: str) -> AsyncGenerator[str, None]:
+    """为已完成的任务生成一条结束事件的 SSE 输出。
+
+    Args:
+        status: 任务结束状态（completed / failed）
+
+    Yields:
+        SSE 格式化的事件字符串
+    """
+    yield f"data: {json.dumps({'event': 'workflow_complete', 'status': status})}\n\n"
+    yield f"data: {json.dumps({'event': '__done__'})}\n\n"
+
+
+async def _event_generator(queue: asyncio.Queue) -> AsyncGenerator[str, None]:
+    """从共享队列中读取事件，以 SSE 格式逐条输出。
+
+    设置 120 秒超时，超过时限后自动关闭流。
+
+    Args:
+        queue: asyncio 事件队列
+
+    Yields:
+        SSE 格式化的事件字符串
+    """
+    try:
+        while True:
+            event = await asyncio.wait_for(queue.get(), timeout=120.0)
+            if event.get("event") == "__done__":
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    except asyncio.TimeoutError:
+        yield f"data: {json.dumps({'event': 'timeout', 'message': '流已超时（120秒）'})}\n\n"
+
+
+@router.post("/{task_id}/approve", response_model=MessageResponse)
+async def approve_bias_flags(
+    task_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+):
+    """人工介入反馈（Human-in-the-Loop）：审批或驳回偏差标记。
+
+    请求体格式：``{"decision": "approved"}`` 或 ``{"decision": "dismissed"}``。
+    审批结果会存储在任务的 config 字段中供后续参考。
+
+    Args:
+        task_id: 筛选任务 ID
+        body: 请求体，包含 decision 字段
+        db: 数据库会话
+
+    Returns:
+        操作结果消息
+
+    Raises:
+        HTTPException 404: 任务不存在
+        HTTPException 422: 决策值无效
+    """
+    task = db.query(ScreeningTask).filter(ScreeningTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="筛选任务不存在")
+
+    decision = body.get("decision", "").strip().lower()
+    if decision not in ("approved", "dismissed"):
+        raise HTTPException(
+            status_code=422,
+            detail="无效的决策值，必须为 'approved' 或 'dismissed'",
+        )
+
+    # 将审批决策记录到任务配置中
+    config = json.loads(task.config) if task.config else {}
+    config["human_decision"] = decision
+    config["human_reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    task.config = json.dumps(config, ensure_ascii=False)
+    db.commit()
+
+    action = "已批准" if decision == "approved" else "已驳回"
+    return MessageResponse(message=f"偏差标记{action}（任务 {task_id}）")

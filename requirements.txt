@@ -1,0 +1,50 @@
+# Agent Framework
+langgraph
+langchain
+langchain-community
+langchain-chroma
+
+# LLM
+openai
+tiktoken
+
+# Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Database
+sqlalchemy
+aiosqlite
+
+# Vector Database
+chromadb
+
+# Document Parsing
+PyMuPDF
+python-docx
+
+# Chinese NLP
+jieba
+
+# Local ML (PyTorch CPU + BGE models)
+torch
+sentence-transformers
+transformers
+
+# Observability
+langsmith
+opentelemetry-api
+
+# Utilities
+pydantic
+pydantic-settings
+tenacity
+diskcache
+httpx
+
+# Dev
+pytest
+pytest-asyncio
+pytest-cov
+pre-commit

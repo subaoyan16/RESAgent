@@ -1,0 +1,25 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - .env:/app/.env
+      - ${USERPROFILE}\.cache\huggingface\hub:/root/.cache/huggingface/hub
+    env_file:
+      - .env
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app/frontend
+    restart: unless-stopped
+    
